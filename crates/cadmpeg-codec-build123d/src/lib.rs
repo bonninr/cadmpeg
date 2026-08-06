@@ -31,16 +31,19 @@
 //! interpreter down with it. Both cases are decided analytically here, and
 //! reported as loss.
 //!
-//! # Blend concavity
+//! # Blend bands
 //!
 //! A toroidal blend face is bounded by two circles that are equally consistent
 //! with the quarter tube of a fillet and with the three-quarter tube around it.
-//! cadmpeg keeps the distinction in the sign of `minor_radius`, which STEP's
-//! `TOROIDAL_SURFACE` has no room for. This encoder emits the band explicitly
-//! rather than leaving an importer to guess.
+//! STEP importers routinely reconstruct the wrong one, which inflates a
+//! filleted part by a full torus per blend. This encoder emits explicit
+//! parametric bounds instead of leaving the choice to the reader.
 
 mod brep;
+mod emit;
 mod geom;
+mod resolve;
+mod topo;
 
 use cadmpeg_core::CodecError;
 use cadmpeg_ir::codec::{EncodeInput, Encoder, ExportPlan};
@@ -59,7 +62,16 @@ impl Encoder for Build123dEncoder {
     }
 
     fn plan<'a>(&self, input: EncodeInput<'a>) -> Result<ExportPlan<'a>, CodecError> {
-        let (source, losses, counts) = brep::Writer::new(input.ir).write();
+        // The feature history is preferred when the document carries one that
+        // resolves: it is the only output a person can meaningfully edit. The
+        // B-rep path is the fallback, and is always available.
+        let (source, losses, counts, path) = emit::write(input.ir).map_or_else(
+            || {
+                let (source, losses, counts) = brep::Writer::new(input.ir).write();
+                (source, losses, counts, "b-rep")
+            },
+            |(source, losses, counts)| (source, losses, counts, "parametric"),
+        );
         let report = ExportReport {
             format: FORMAT_ID.to_owned(),
             census: EntityCensus {
@@ -73,7 +85,10 @@ impl Encoder for Build123dEncoder {
             },
             write_path: WritePath::Synthesized,
             losses,
-            notes: vec!["The emitted program requires build123d 0.10 or newer.".to_owned()],
+            notes: vec![
+                format!("Emitted from the {path} path."),
+                "The emitted program requires build123d 0.10 or newer.".to_owned(),
+            ],
         };
         Ok(ExportPlan::buffered(report, source.into_bytes()))
     }

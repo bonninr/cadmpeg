@@ -20,15 +20,19 @@
 //! an error: a carrier the IR cannot supply, and a wire that does not lie on
 //! the carrier it would trim. Both are decided here, before the kernel sees
 //! them.
+//!
+//! A toroidal face gets explicit parametric bounds rather than natural ones,
+//! because its two boundary circles leave the band of the tube ambiguous.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
 use cadmpeg_ir::document::CadIr;
-use cadmpeg_ir::geometry::{Curve, CurveGeometry, Surface, SurfaceGeometry};
+use cadmpeg_ir::geometry::{CurveGeometry, SurfaceGeometry};
 use cadmpeg_ir::report::{LossKind, LossNote};
-use cadmpeg_ir::topology::{Coedge, Edge, Face, Loop, Point, Vertex};
+use cadmpeg_ir::topology::{Edge, Face};
 
 use crate::geom::{self, Vec3};
+use crate::topo::Topology;
 
 /// Preamble shared by every emitted program.
 const PREAMBLE: &str = r"import sys
@@ -94,123 +98,10 @@ else:
     print("volume: 0.000000 (empty)")
 "#;
 
-/// Everything the writer needs to look up by identity.
-struct Index<'a> {
-    surfaces: HashMap<&'a str, &'a Surface>,
-    loops: HashMap<&'a str, &'a Loop>,
-    coedges: HashMap<&'a str, &'a Coedge>,
-    edges: HashMap<&'a str, &'a Edge>,
-    vertices: HashMap<&'a str, &'a Vertex>,
-    points: HashMap<&'a str, &'a Point>,
-    curves: HashMap<&'a str, &'a Curve>,
-}
-
-impl<'a> Index<'a> {
-    fn new(ir: &'a CadIr) -> Self {
-        Self {
-            surfaces: ir
-                .model
-                .surfaces
-                .iter()
-                .map(|entity| (entity.id.as_str(), entity))
-                .collect(),
-            loops: ir
-                .model
-                .loops
-                .iter()
-                .map(|entity| (entity.id.as_str(), entity))
-                .collect(),
-            coedges: ir
-                .model
-                .coedges
-                .iter()
-                .map(|entity| (entity.id.as_str(), entity))
-                .collect(),
-            edges: ir
-                .model
-                .edges
-                .iter()
-                .map(|entity| (entity.id.as_str(), entity))
-                .collect(),
-            vertices: ir
-                .model
-                .vertices
-                .iter()
-                .map(|entity| (entity.id.as_str(), entity))
-                .collect(),
-            points: ir
-                .model
-                .points
-                .iter()
-                .map(|entity| (entity.id.as_str(), entity))
-                .collect(),
-            curves: ir
-                .model
-                .curves
-                .iter()
-                .map(|entity| (entity.id.as_str(), entity))
-                .collect(),
-        }
-    }
-
-    /// Solved endpoints of an edge, in start-then-end order.
-    fn edge_points(&self, edge: &Edge) -> Vec<Vec3> {
-        [&edge.start, &edge.end]
-            .into_iter()
-            .filter_map(|vertex| self.vertices.get(vertex.as_str()))
-            .filter_map(|vertex| self.points.get(vertex.point.as_str()))
-            .map(|point| Vec3::from(point.position))
-            .collect()
-    }
-
-    /// Every edge bounding a face, in loop order and without repetition.
-    fn face_edges(&self, face: &Face) -> Vec<&'a Edge> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for loop_id in &face.loops {
-            let Some(owner) = self.loops.get(loop_id.as_str()) else {
-                continue;
-            };
-            for coedge_id in &owner.coedges {
-                let Some(coedge) = self.coedges.get(coedge_id.as_str()) else {
-                    continue;
-                };
-                let Some(edge) = self.edges.get(coedge.edge.as_str()) else {
-                    continue;
-                };
-                if seen.insert(edge.id.as_str()) {
-                    out.push(*edge);
-                }
-            }
-        }
-        out
-    }
-
-    /// Edges a face uses more than once, which is how a closed carrier records
-    /// its seam.
-    fn seam_edges(&self, face: &Face) -> HashSet<&'a str> {
-        let mut uses: HashMap<&str, usize> = HashMap::new();
-        for loop_id in &face.loops {
-            let Some(owner) = self.loops.get(loop_id.as_str()) else {
-                continue;
-            };
-            for coedge_id in &owner.coedges {
-                if let Some(coedge) = self.coedges.get(coedge_id.as_str()) {
-                    *uses.entry(coedge.edge.as_str()).or_default() += 1;
-                }
-            }
-        }
-        uses.into_iter()
-            .filter(|(_, count)| *count > 1)
-            .map(|(edge, _)| edge)
-            .collect()
-    }
-}
-
 /// Emits a build123d program that rebuilds the document's solved B-rep.
 pub(crate) struct Writer<'a> {
     ir: &'a CadIr,
-    index: Index<'a>,
+    index: Topology<'a>,
     lines: Vec<String>,
     indent: usize,
     wire_seq: usize,
@@ -222,7 +113,7 @@ impl<'a> Writer<'a> {
     pub(crate) fn new(ir: &'a CadIr) -> Self {
         Self {
             ir,
-            index: Index::new(ir),
+            index: Topology::new(ir),
             lines: Vec::new(),
             indent: 0,
             wire_seq: 0,
@@ -277,14 +168,18 @@ impl<'a> Writer<'a> {
     // -- face dispatch ------------------------------------------------------
 
     fn face(&mut self, face: &'a Face) -> bool {
-        let Some(surface) = self.index.surfaces.get(face.surface.as_str()) else {
+        let Some(geometry) = self
+            .index
+            .surfaces
+            .get(face.surface.as_str())
+            .map(|surface| &surface.geometry)
+        else {
             self.loss(
                 LossKind::UnknownSurfaceFaceOmitted,
                 format!("face {} has no surface carrier", face.id),
             );
             return false;
         };
-        let geometry = &surface.geometry;
         if geom::surface_frame(geometry).is_none() {
             self.loss(
                 LossKind::UnsupportedObjectFamily,
@@ -420,10 +315,9 @@ impl<'a> Writer<'a> {
 
     /// Parametric bounds of a full-revolution face.
     ///
-    /// The minor-angle band of a toroidal blend is where the sign of
-    /// `minor_radius` earns its keep: a concave blend is a quarter tube, and
-    /// dropping the sign leaves the complementary band equally consistent with
-    /// the two boundary circles.
+    /// Emitting bounds explicitly is what keeps a toroidal blend at its true
+    /// extent: the two boundary circles alone do not say which band of the tube
+    /// carries material.
     fn parametric_bounds(&self, face: &'a Face, geometry: &SurfaceGeometry) -> Option<[f64; 4]> {
         let (origin, axis, _) = geom::surface_frame(geometry)?;
         let mut stations = Vec::new();
@@ -538,18 +432,23 @@ impl<'a> Writer<'a> {
     /// Boundary wires of a face as edge expressions, widest ring first.
     fn face_wires(&mut self, face: &'a Face) -> Option<Vec<Vec<String>>> {
         let mut rings: Vec<(f64, Vec<String>)> = Vec::new();
-        for loop_id in &face.loops {
-            let owner = self.index.loops.get(loop_id.as_str())?;
+        // Collected first so the borrow of the index ends before edges are
+        // turned into expressions, which records loss on the writer.
+        let boundary: Vec<Vec<&'a Edge>> = self
+            .index
+            .loops_of(face)
+            .map(|owner| {
+                self.index
+                    .coedges_of(owner)
+                    .filter_map(|coedge| self.index.edge(coedge.edge.as_str()))
+                    .collect()
+            })
+            .collect();
+        for ring in boundary {
             let mut expressions = Vec::new();
             let mut extent = 0.0f64;
             let mut usable = true;
-            for coedge_id in &owner.coedges {
-                let Some(coedge) = self.index.coedges.get(coedge_id.as_str()) else {
-                    continue;
-                };
-                let Some(edge) = self.index.edges.get(coedge.edge.as_str()) else {
-                    continue;
-                };
+            for edge in ring {
                 match self.edge_expression(edge) {
                     Some((expression, size)) => {
                         expressions.push(expression);
@@ -734,7 +633,15 @@ fn curve_family(geometry: &CurveGeometry) -> &'static str {
     }
 }
 
-/// The shorter arc between the sampled minor angles of a toroidal face.
+/// The minor-angle band of a toroidal face, taken as the shorter arc between
+/// its boundary circles.
+///
+/// The two circles bounding a blend are equally consistent with the quarter
+/// tube and with the three-quarter tube around it, which is why STEP importers
+/// routinely reconstruct the wrong one. Emitting explicit bounds settles it
+/// here. The shorter arc is the right reading for a blend, whose tube never
+/// exceeds a half turn; a wider band would need the sign of `minor_radius`,
+/// which records concavity, to be resolved against the support surfaces.
 fn torus_band(angles: &[f64]) -> (f64, f64) {
     if angles.len() < 2 {
         return (0.0, std::f64::consts::TAU);
@@ -798,4 +705,35 @@ fn short_label(identity: &str) -> String {
         .next()
         .unwrap_or(identity)
         .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::torus_band;
+
+    #[test]
+    fn a_blend_band_is_the_arc_between_its_boundary_circles() {
+        // A quarter tube from the tangency with a wall to the tangency with a
+        // face: the band must stay the quarter, not the three quarters around.
+        let (start, end) = torus_band(&[0.0, std::f64::consts::FRAC_PI_2]);
+        assert!((start - 0.0).abs() < 1e-12);
+        assert!((end - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_band_crossing_the_seam_unwraps_forward() {
+        // Angles either side of zero describe an arc through the seam, so the
+        // band has to continue past it rather than sweep the long way back.
+        let (start, end) = torus_band(&[0.2, std::f64::consts::TAU - 0.2]);
+        assert!(start > end - std::f64::consts::TAU + 1e-9);
+        assert!(end > start, "the band must advance");
+        assert!(end - start < std::f64::consts::PI, "and stay the short arc");
+    }
+
+    #[test]
+    fn a_single_sample_falls_back_to_the_full_tube() {
+        let (start, end) = torus_band(&[1.0]);
+        assert!((start - 0.0).abs() < 1e-12);
+        assert!((end - std::f64::consts::TAU).abs() < 1e-12);
+    }
 }

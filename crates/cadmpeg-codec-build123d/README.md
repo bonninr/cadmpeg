@@ -32,9 +32,9 @@ Anything it cannot rebuild exactly is reported as a `LossNote` rather than appro
 
 Both are decided in closed form before the kernel sees them. The emitted program also guards each face individually, so one face the kernel refuses at run time cannot take the rest of the model down with it.
 
-## Blend concavity
+## Blend bands
 
-A toroidal blend face is bounded by two circles that are equally consistent with the quarter tube of a fillet and with the three-quarter tube around it. cadmpeg keeps the distinction in the sign of `minor_radius`, which STEP's `TOROIDAL_SURFACE` has no room for. This encoder emits the band explicitly rather than leaving an importer to guess, so a filleted part exports at its true volume.
+A toroidal blend face is bounded by two circles that are equally consistent with the quarter tube of a fillet and with the three-quarter tube around it. STEP importers routinely reconstruct the wrong one, which inflates a filleted part by a full torus per blend. This encoder emits explicit parametric bounds, taking the arc its boundary circles actually describe, so a filleted part keeps its true volume.
 
 ## Requirements
 

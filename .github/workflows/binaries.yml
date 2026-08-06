@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Builds the CLI for Windows and Linux on demand.
+#
+# This is deliberately manual. The project's `release.yml` builds signed,
+# installer-wrapped artifacts when a tag is pushed, which is the right process
+# for a release but far too much ceremony for "I want to try the binary".
+# Trigger this one from the Actions tab, pick a branch, and collect the
+# executables from the run's artifacts.
+name: binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Cargo profile to build
+        type: choice
+        default: release
+        options: [release, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            artifact: cadmpeg.exe
+          - name: linux-x86_64
+            os: ubuntu-latest
+            artifact: cadmpeg
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain is pinned by rust-toolchain.toml, so no version is named
+      # here; naming one would let CI drift from a local build.
+      - name: Show toolchain
+        run: rustup show
+
+      # Only the registry is cached. A release `target/` for this workspace runs
+      # to several gigabytes, which crowds out every other cache under the 10 GB
+      # repository limit for a saving measured in seconds.
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: binaries-${{ matrix.name }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ inputs.profile }}" = "release" ]; then
+            cargo build --release -p cadmpeg
+            echo "BIN_DIR=target/release" >> "$GITHUB_ENV"
+          else
+            cargo build -p cadmpeg
+            echo "BIN_DIR=target/debug" >> "$GITHUB_ENV"
+          fi
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          "$BIN_DIR/${{ matrix.artifact }}" --version
+          "$BIN_DIR/${{ matrix.artifact }}" convert \
+            crates/cadmpeg-codec-f3d/tests/golden/fixtures/generated_unit_cube.f3d \
+            -f build123d -o cube.py --force
+          # The emitted program is the deliverable, so fail the build if it is
+          # not at least syntactically valid Python.
+          python -c "import ast, pathlib; ast.parse(pathlib.Path('cube.py').read_text())"
+          head -12 cube.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cadmpeg-${{ matrix.name }}
+          path: ${{ env.BIN_DIR }}/${{ matrix.artifact }}
+          if-no-files-found: error
